@@ -1,6 +1,7 @@
 # Elasticsearch DNS Analytics Stack
 
 Complete DNS log analytics solution using Elasticsearch, Kibana, Logstash, and Kafka for real-time DNS query analysis and geolocation visualization.
+
 _AI Tools like Claude, Gemini, Ollama, qwen3-coder, gpt-oss, Continue and Cursor AI assisted in the generation of this Code and Documentation_
 
 ## Overview
