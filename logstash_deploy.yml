@@ -1,0 +1,196 @@
+---
+- name: Deploy Logstash with Kafka Integration
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    kubeconfig: "<< Path to your kubeconfig file >>"
+    elastic_ns: "elastic-cluster"
+    logstash_version: "9.2.1"
+    logstash_config_file: "logstash.conf"
+
+  tasks:
+    - name: Check if Elasticsearch namespace exists
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ elastic_ns }}"
+      register: namespace_check
+
+    - name: Fail if Elasticsearch namespace does not exist
+      ansible.builtin.fail:
+        msg: "Namespace {{ elastic_ns }} does not exist. Please run elasticsearch_create.yml first."
+      when: namespace_check.resources | length == 0
+
+    - name: Read Logstash configuration file
+      ansible.builtin.slurp:
+        src: "{{ logstash_config_file }}"
+      register: logstash_config_content
+
+    - name: Create Logstash ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: logstash-config
+            namespace: "{{ elastic_ns }}"
+          data:
+            logstash.conf: "{{ logstash_config_content.content | b64decode }}"
+            logstash.yml: |
+              api.http.host: "0.0.0.0"
+              xpack.monitoring.enabled: false
+
+    - name: Create Logstash Service Account
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: logstash
+            namespace: "{{ elastic_ns }}"
+
+    - name: Deploy Logstash
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: logstash
+            namespace: "{{ elastic_ns }}"
+            labels:
+              app: logstash
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: logstash
+            template:
+              metadata:
+                labels:
+                  app: logstash
+              spec:
+                serviceAccountName: logstash
+                containers:
+                  - name: logstash
+                    image: docker.elastic.co/logstash/logstash:{{ logstash_version }}
+                    imagePullPolicy: IfNotPresent
+                    ports:
+                      - containerPort: 9600
+                        name: http
+                        protocol: TCP
+                    env:
+                      - name: LS_JAVA_OPTS
+                        value: "-Xms512m -Xmx512m"
+                    volumeMounts:
+                      - name: config
+                        mountPath: /usr/share/logstash/pipeline/logstash.conf
+                        subPath: logstash.conf
+                      - name: config
+                        mountPath: /usr/share/logstash/config/logstash.yml
+                        subPath: logstash.yml
+                    resources:
+                      requests:
+                        memory: "512Mi"
+                        cpu: "250m"
+                      limits:
+                        memory: "1Gi"
+                        cpu: "1000m"
+                    livenessProbe:
+                      httpGet:
+                        path: /
+                        port: 9600
+                      initialDelaySeconds: 60
+                      periodSeconds: 30
+                      timeoutSeconds: 5
+                      failureThreshold: 3
+                    readinessProbe:
+                      httpGet:
+                        path: /
+                        port: 9600
+                      initialDelaySeconds: 30
+                      periodSeconds: 10
+                      timeoutSeconds: 5
+                      failureThreshold: 3
+                volumes:
+                  - name: config
+                    configMap:
+                      name: logstash-config
+
+    - name: Create Logstash Service (for monitoring)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: logstash
+            namespace: "{{ elastic_ns }}"
+            labels:
+              app: logstash
+          spec:
+            selector:
+              app: logstash
+            ports:
+              - name: http
+                port: 9600
+                targetPort: 9600
+                protocol: TCP
+            type: ClusterIP
+
+    - name: Wait for Logstash to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ elastic_ns }}"
+        label_selectors:
+          - app=logstash
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 300
+      register: logstash_pod
+
+    - name: Display Logstash deployment information
+      ansible.builtin.debug:
+        msg: |
+          Logstash deployed successfully!
+
+          Namespace: {{ elastic_ns }}
+          Deployment: logstash
+          Version: {{ logstash_version }}
+
+          Kafka Configuration:
+          - Server: << Kafka broker IP:port >>
+          - Topics:
+            * journals (systemd journal logs)
+            * pihole (Pi-hole DNS logs)
+
+          Elasticsearch Integration:
+          - Target: http://elasticsearch:9200
+          - Indices:
+            * journals-YYYY.MM.DD (daily rotation)
+            * pihole-YYYY.MM.DD (daily rotation with GeoIP)
+
+          To check Logstash status:
+          kubectl logs -f deployment/logstash -n {{ elastic_ns }}
+
+          To check Logstash monitoring API:
+          kubectl port-forward svc/logstash 9600:9600 -n {{ elastic_ns }}
+          Then visit: http://localhost:9600
+
+          Data flow:
+          Kafka (<< Kafka broker IP:port >>) → Logstash → Elasticsearch → Kibana
+
+

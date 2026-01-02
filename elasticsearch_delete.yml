@@ -1,0 +1,95 @@
+---
+- name: Delete Elasticsearch Resources (Preserve PV/PVC)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    kubeconfig: "<< Path to your kubeconfig file >>"
+    elastic_ns: "elastic-cluster"
+
+  tasks:
+    - name: Delete Ingress for Kibana
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: networking.k8s.io/v1
+        kind: Ingress
+        name: kibana-ingress
+        namespace: "{{ elastic_ns }}"
+
+    - name: Delete Kibana Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: Service
+        name: kibana
+        namespace: "{{ elastic_ns }}"
+
+    - name: Delete Kibana Deployment
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: apps/v1
+        kind: Deployment
+        name: kibana
+        namespace: "{{ elastic_ns }}"
+
+    - name: Delete Elasticsearch Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: Service
+        name: elasticsearch
+        namespace: "{{ elastic_ns }}"
+
+    - name: Delete Elasticsearch Deployment
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: apps/v1
+        kind: Deployment
+        name: elasticsearch
+        namespace: "{{ elastic_ns }}"
+
+    # Note: PVC and PV are intentionally NOT deleted to preserve data
+    # Note: Namespace is NOT deleted since it contains the PVC
+
+    - name: Wait for Deployments to be fully deleted
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ elastic_ns }}"
+        name: "{{ item }}"
+      register: deployment_info
+      until: deployment_info.resources | length == 0
+      retries: 30
+      delay: 2
+      loop:
+        - elasticsearch
+        - kibana
+
+    - name: Display deletion status
+      ansible.builtin.debug:
+        msg: |
+          Elasticsearch resources deleted successfully!
+
+          Namespace: {{ elastic_ns }} (PRESERVED)
+          PVC: elasticsearch-data (PRESERVED)
+          PV: Associated PersistentVolume (PRESERVED)
+
+          Deleted resources:
+            - Ingress: kibana-ingress
+            - Service: kibana
+            - Service: elasticsearch
+            - Deployment: kibana
+            - Deployment: elasticsearch
+
+          To completely remove the namespace and data:
+          kubectl delete pvc elasticsearch-data -n {{ elastic_ns }}
+          kubectl delete namespace {{ elastic_ns }}
+
+

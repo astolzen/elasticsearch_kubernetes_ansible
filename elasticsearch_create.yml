@@ -1,0 +1,311 @@
+---
+- name: Deploy Elasticsearch Single Node Stack
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    kubeconfig: "<< Path to your kubeconfig file >>"
+    elastic_ns: "elastic-cluster"
+    cluster_name: "elastic-single"
+    elasticsearch_version: "9.2.1"
+    kibana_version: "9.2.1"
+    kibana_url: "<< Your Kibana domain >>"
+
+  tasks:
+    - name: Create Elasticsearch Namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ elastic_ns }}"
+
+    - name: Create Elasticsearch PVC
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: elasticsearch-data
+            namespace: "{{ elastic_ns }}"
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 25Gi
+
+    - name: Deploy Elasticsearch
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: elasticsearch
+            namespace: "{{ elastic_ns }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: elasticsearch
+            template:
+              metadata:
+                labels:
+                  app: elasticsearch
+              spec:
+                initContainers:
+                  - name: sysctl
+                    image: busybox:latest
+                    securityContext:
+                      privileged: true
+                    command:
+                      - sh
+                      - -c
+                      - |
+                        sysctl -w vm.max_map_count=262144
+                        echo "vm.max_map_count set to 262144"
+                  - name: fix-permissions
+                    image: busybox:latest
+                    command:
+                      - sh
+                      - -c
+                      - |
+                        chown -R 1000:1000 /usr/share/elasticsearch/data
+                        chmod -R 755 /usr/share/elasticsearch/data
+                    volumeMounts:
+                      - name: elasticsearch-data
+                        mountPath: /usr/share/elasticsearch/data
+                containers:
+                  - name: elasticsearch
+                    image: docker.elastic.co/elasticsearch/elasticsearch:{{ elasticsearch_version }}
+                    ports:
+                      - containerPort: 9200
+                        name: http
+                      - containerPort: 9300
+                        name: transport
+                    env:
+                      - name: discovery.type
+                        value: single-node
+                      - name: ES_JAVA_OPTS
+                        value: "-Xms512m -Xmx512m"
+                      - name: xpack.security.enabled
+                        value: "false"
+                      - name: xpack.security.http.ssl.enabled
+                        value: "false"
+                      - name: xpack.security.transport.ssl.enabled
+                        value: "false"
+                    volumeMounts:
+                      - name: elasticsearch-data
+                        mountPath: /usr/share/elasticsearch/data
+                    resources:
+                      requests:
+                        memory: "1Gi"
+                        cpu: "500m"
+                      limits:
+                        memory: "2Gi"
+                        cpu: "2000m"
+                volumes:
+                  - name: elasticsearch-data
+                    persistentVolumeClaim:
+                      claimName: elasticsearch-data
+
+    - name: Create Elasticsearch Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: elasticsearch
+            namespace: "{{ elastic_ns }}"
+          spec:
+            selector:
+              app: elasticsearch
+            ports:
+              - name: http
+                port: 9200
+                targetPort: 9200
+              - name: transport
+                port: 9300
+                targetPort: 9300
+
+    - name: Deploy Kibana
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: kibana
+            namespace: "{{ elastic_ns }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: kibana
+            template:
+              metadata:
+                labels:
+                  app: kibana
+              spec:
+                containers:
+                  - name: kibana
+                    image: docker.elastic.co/kibana/kibana:{{ kibana_version }}
+                    ports:
+                      - containerPort: 5601
+                        name: http
+                    env:
+                      - name: ELASTICSEARCH_HOSTS
+                        value: "http://elasticsearch:9200"
+                      - name: SERVER_NAME
+                        value: "kibana"
+                      - name: XPACK_SECURITY_ENABLED
+                        value: "false"
+
+    - name: Create Kibana Service
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: kibana
+            namespace: "{{ elastic_ns }}"
+          spec:
+            selector:
+              app: kibana
+            ports:
+              - name: http
+                port: 5601
+                targetPort: 5601
+
+    - name: Create Ingress for Kibana
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: kibana-ingress
+            namespace: "{{ elastic_ns }}"
+          spec:
+            rules:
+              - host: "{{ kibana_url }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: kibana
+                          port:
+                            number: 5601
+
+    - name: Wait for Elasticsearch to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ elastic_ns }}"
+        label_selectors:
+          - app=elasticsearch
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 300
+
+    - name: Wait for Elasticsearch API to be responsive
+      ansible.builtin.shell: |
+        kubectl --kubeconfig={{ kubeconfig }} exec -n {{ elastic_ns }} deployment/elasticsearch -- curl -s -o /dev/null -w "%{http_code}" http://localhost:9200/_cluster/health
+      register: elastic_health
+      until: elastic_health.stdout == "200"
+      retries: 30
+      delay: 2
+
+    - name: Create GeoIP Ingest Pipeline for DNS Resolution Data
+      ansible.builtin.shell: |
+        kubectl --kubeconfig={{ kubeconfig }} exec -n {{ elastic_ns }} deployment/elasticsearch -- curl -X PUT "http://localhost:9200/_ingest/pipeline/geoip-pipeline" -H 'Content-Type: application/json' -d '{
+          "description": "Add geoip info for DNS resolved IPs",
+          "processors": [
+            {
+              "geoip": {
+                "field": "dns_queried_system_ip",
+                "target_field": "dns_queried_system_geoip",
+                "ignore_missing": true,
+                "properties": ["continent_name", "country_iso_code", "country_name", "region_name", "city_name", "location"]
+              }
+            },
+            {
+              "script": {
+                "description": "Convert location object to geo_point format",
+                "lang": "painless",
+                "source": "if (ctx.dns_queried_system_geoip?.location?.lat != null && ctx.dns_queried_system_geoip?.location?.lon != null) { ctx.dns_queried_system_geoip.location = ctx.dns_queried_system_geoip.location.lat + \",\" + ctx.dns_queried_system_geoip.location.lon; }",
+                "ignore_failure": true
+              }
+            }
+          ]
+        }'
+      register: geoip_pipeline_result
+      changed_when: geoip_pipeline_result.rc == 0
+
+    - name: Create Index Template to Auto-Apply GeoIP Pipeline to pihole indices
+      ansible.builtin.shell: |
+        kubectl --kubeconfig={{ kubeconfig }} exec -n {{ elastic_ns }} deployment/elasticsearch -- curl -X PUT "http://localhost:9200/_index_template/pihole-geoip-template" -H 'Content-Type: application/json' -d '{
+          "index_patterns": ["pihole-*"],
+          "priority": 100,
+          "template": {
+            "settings": {
+              "index.default_pipeline": "geoip-pipeline"
+            },
+            "mappings": {
+              "properties": {
+                "dns_queried_system_geoip": {
+                  "properties": {
+                    "location": {
+                      "type": "geo_point"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }'
+      register: index_template_result
+      changed_when: index_template_result.rc == 0
+
+    - name: Display Elasticsearch access information
+      ansible.builtin.debug:
+        msg: |
+          Elasticsearch stack deployed successfully!
+
+          Cluster Name: {{ cluster_name }}
+          Namespace: {{ elastic_ns }}
+
+          To access Elasticsearch:
+          kubectl port-forward svc/elasticsearch 9200:9200 -n {{ elastic_ns }}
+          Then visit: http://localhost:9200
+
+          To access Kibana:
+          Visit: http://<< Your Kibana domain >>
+          Or: kubectl port-forward svc/kibana 5601:5601 -n {{ elastic_ns }}
+
+          GeoIP Configuration:
+          - Ingest pipeline 'geoip-pipeline' created for DNS IP geolocation
+          - Index template 'pihole-geoip-template' configured to auto-apply GeoIP to pihole-* indices
+          - DNS resolution IPs will be enriched with location data (country, city, coordinates)
+
+          No authentication required (security disabled for simplicity)
+
+
